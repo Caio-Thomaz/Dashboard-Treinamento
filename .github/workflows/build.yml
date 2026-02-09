@@ -1,58 +1,291 @@
-name: Build and Deploy Dashboard
+import json
+import os
+from datetime import date
+import pandas as pd
 
-on:
-  push:
-    branches: [ main ]
-  schedule:
-    - cron: '0 8 * * *'   # todos os dias às 08:00 UTC (~05:00 MS)
-  workflow_dispatch:
+INPUT_XLSX = 'base_treinamentos_limpa.xlsx'  # mantenha esse nome na raiz do repo
 
-permissions:
-  contents: write
-  pages: write
-  id-token: write
+# ===== 1) Carrega e prepara dados =====
+df = pd.read_excel(INPUT_XLSX, engine='openpyxl')
+df['Data'] = pd.to_datetime(df['Data'], errors='coerce')
+df['Dias_para_vencer'] = pd.to_numeric(df['Dias_para_vencer'], errors='coerce')
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+df['Data Vencimento'] = df['Data'] + pd.to_timedelta(df['Dias_para_vencer'], unit='D')
+today = pd.to_datetime(date.today())
+df['Dias Restantes'] = (df['Data Vencimento'] - today).dt.days
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+def status(d):
+    if pd.isna(d):
+        return 'Indefinido'
+    if d < 0:
+        return 'Vencido'
+    if d <= 30:
+        return 'A vencer'
+    return 'Dentro do prazo'
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pandas plotly openpyxl
+df['Status'] = df['Dias Restantes'].apply(status)
 
-      - name: Build dashboard
-        run: |
-          python build_dashboard.py
+safe = df.copy()
+safe['Data'] = safe['Data'].dt.strftime('%Y-%m-%d')
+safe['Data Vencimento'] = safe['Data Vencimento'].dt.strftime('%Y-%m-%d')
 
-      # Configuração recomendada do Pages
-      - name: Configure Pages
-        uses: actions/configure-pages@v5
+records = safe[['Colaborador','Treinamento','Data','Data Vencimento','Dias Restantes','Status']].fillna('').to_dict(orient='records')
+json_data = json.dumps(records, ensure_ascii=False)
 
-      # Publica o conteúdo gerado (inclui index.html)
-      - name: Upload artifact (Pages)
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: .
+# ===== 2) HTML/CSS/JS =====
+logo_html = ''
+if os.path.exists('logo.png'):
+    logo_html = '<img src="logo.png" alt="logo" style="height:36px;margin-right:12px;vertical-align:middle;">'
 
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    permissions:
-      pages: write
-      id-token: write
-    steps:
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4
+CSS = """
+  body { font-family: Arial, sans-serif; margin: 20px; }
+  header { display:flex; align-items:center; gap:12px; }
+  h1 { margin: 0; }
+  .subtitle { color:#555; margin:0 0 12px 0; }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:12px 0; }
+  select, button { padding:8px; border:1px solid #ccc; border-radius:6px; }
+  .kpis { display:flex; gap:12px; margin: 16px 0; flex-wrap: wrap; }
+  .kpi { padding: 12px 16px; border-radius: 8px; color: #fff; font-weight: bold; min-width: 180px; }
+  .kpi span { font-size: 24px; display: block; margin-top: 4px; }
+  .kpi-red { background: #d84a4a; }
+  .kpi-amber { background: #e0a800; color:#000; }
+  .kpi-green { background: #2e7d32; }
+  .layout { display:grid; grid-template-columns: 1fr; gap:18px; }
+  @media (min-width: 1100px){ .layout { grid-template-columns: 2fr 1fr; } }
+  .card { padding:12px; border:1px solid #eee; border-radius:10px; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border:1px solid #ddd; padding:8px; }
+  th { background:#f5f5f5; cursor:pointer; }
+  .status { font-weight:bold; padding:4px 8px; border-radius:6px; color:#fff; display:inline-block; }
+  .s-vermelho { background:#d84a4a; }
+  .s-amarelo { background:#e0a800; color:#000; }
+  .s-verde { background:#2e7d32; }
+  footer { margin-top:24px; color:#666; font-size:12px; }
+  nav a { margin-left: 12px; }
+"""
+
+JS = f"""
+  const RAW_DATA = {json_data};
+  let currentSort = {{ key: 'Dias Restantes', asc: true }};
+
+  function unique(list){{ return Array.from(new Set(list.filter(v => v !== ''))).sort(); }}
+
+  function populateFilters(data){{
+    const colabSel = document.getElementById('f-colab');
+    const statusSel = document.getElementById('f-status');
+    const colabs = unique(data.map(d => d['Colaborador']));
+    const statuses = unique(data.map(d => d['Status']));
+
+    colabSel.innerHTML = '<option value=\"\">Todos os colaboradores</option>' + colabs.map(c=>`<option value=\"${{c}}\">${{c}}</option>`).join('');
+    statusSel.innerHTML = '<option value=\"\">Todos os status</option>' + statuses.map(s=>`<option value=\"${{s}}\">${{s}}</option>`).join('');
+  }}
+
+  function getFilters(){{
+    const c = document.getElementById('f-colab').value;
+    const s = document.getElementById('f-status').value;
+    return {{ c, s }};
+  }}
+
+  function applyFilters(data){{
+    const {{c, s}} = getFilters();
+    return data.filter(d => (!c || d['Colaborador']===c) && (!s || d['Status']===s));
+  }}
+
+  function renderKPIs(data){{
+    const vencidos = data.filter(d=> d['Dias Restantes'] < 0).length;
+    const aVencer = data.filter(d=> d['Dias Restantes'] >= 0 && d['Dias Restantes'] <= 30).length;
+    const ok = data.filter(d=> d['Dias Restantes'] > 30).length;
+    document.getElementById('kpi-venc').innerText = vencidos;
+    document.getElementById('kpi-30').innerText = aVencer;
+    document.getElementById('kpi-ok').innerText = ok;
+  }}
+
+  function toTraceMain(data){{
+    return {{
+      x: data.map(d=> d['Colaborador']),
+      y: data.map(d=> d['Dias Restantes']),
+      type: 'bar',
+      marker: {{ color: data.map(d=> d['Treinamento']) }},
+      text: data.map(d=> `${{d['Treinamento']}}<br>Data: ${{d['Data']}}<br>Venc: ${{d['Data Vencimento']}}<br>Status: ${{d['Status']}}`),
+      hoverinfo: 'text'
+    }};
+  }}
+
+  function renderMainChart(data){{
+    const trace = toTraceMain(data);
+    const layout = {{ title:'Dias Restantes por Colaborador e Treinamento', xaxis:{{title:'Colaborador'}}, yaxis:{{title:'Dias Restantes'}} }};
+    Plotly.newPlot('chart-main', [trace], layout, {{responsive:true}});
+  }}
+
+  function renderGroupChart(data){{
+    const key = (t,s)=> `${{t}}__${{s}}`;
+    const counts = {{}};
+    const treinos = unique(data.map(d=> d['Treinamento']));
+    const statuses = ['Vencido','A vencer','Dentro do prazo'];
+    treinos.forEach(t=> statuses.forEach(s=> counts[key(t,s)] = 0));
+    data.forEach(d=> counts[key(d['Treinamento'], d['Status'])] = (counts[key(d['Treinamento'], d['Status'])]||0)+1);
+
+    const traces = statuses.map((s)=>({{
+      x: treinos,
+      y: treinos.map(t=> counts[key(t,s)]||0),
+      name: s,
+      type: 'bar'
+    }}));
+
+    const layout = {{ barmode:'stack', title:'Qtd por Treinamento (stack por Status)', xaxis:{{title:'Treinamento'}}, yaxis:{{title:'Quantidade'}} }};
+    Plotly.newPlot('chart-group', traces, layout, {{responsive:true}});
+  }}
+
+  function statusClass(s){{
+    if (s==='Vencido') return 's-vermelho';
+    if (s==='A vencer') return 's-amarelo';
+    if (s==='Dentro do prazo') return 's-verde';
+    return '';
+  }}
+
+  function renderTable(data){{
+    const thead = document.querySelector('#tbl thead');
+    const tbody = document.querySelector('#tbl tbody');
+    thead.innerHTML = '';
+    tbody.innerHTML = '';
+
+    const cols = ['Colaborador','Treinamento','Data','Data Vencimento','Dias Restantes','Status'];
+    const trh = document.createElement('tr');
+    cols.forEach(col=>{{
+      const th = document.createElement('th');
+      th.textContent = col;
+      th.onclick = ()=> toggleSort(col);
+      trh.appendChild(th);
+    }});
+    thead.appendChild(trh);
+
+    data.forEach(r=>{{
+      const tr = document.createElement('tr');
+      cols.forEach(col=>{{
+        const td = document.createElement('td');
+        if (col==='Status'){{
+          const span = document.createElement('span');
+          span.className = 'status ' + statusClass(r[col]);
+          span.textContent = r[col];
+          td.appendChild(span);
+        }} else {{
+          td.textContent = r[col];
+        }}
+        tr.appendChild(td);
+      }});
+      tbody.appendChild(tr);
+    }});
+  }}
+
+  function toggleSort(col){{
+    if (currentSort.key === col){{ currentSort.asc = !currentSort.asc; }}
+    else {{ currentSort.key = col; currentSort.asc = true; }}
+    refresh();
+  }}
+
+  function sortData(data){{
+    const k = currentSort.key; const asc = currentSort.asc ? 1 : -1;
+    const parse = (v)=>{
+      if (k==='Dias Restantes') return Number(v);
+      if (k==='Data' || k==='Data Vencimento') return new Date(v||'1970-01-01').getTime();
+      return (v||'').toString().toUpperCase();
+    }
+    return data.slice().sort((a,b)=> parse(a[k])>parse(b[k])? asc : parse(a[k])<parse(b[k])? -asc : 0);
+  }}
+
+  function toCSV(data){{
+    const cols = ['Colaborador','Treinamento','Data','Data Vencimento','Dias Restantes','Status'];
+    const esc = (s)=> '\"'+String(s).replaceAll('\"','\"\"')+'\"';
+    const rows = [cols.join(',')].concat(data.map(r=> cols.map(c=> esc(r[c])).join(',')));
+    return rows.join('\\n');
+  }}
+
+  function exportCSV(){{
+    const filtered = applyFilters(RAW_DATA);
+    const sorted = sortData(filtered);
+    const blob = new Blob([toCSV(sorted)], {{type:'text/csv;charset=utf-8;'}});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'treinamentos_filtrado.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }}
+
+  function refresh(){{
+    const filtered = applyFilters(RAW_DATA);
+    const sorted = sortData(filtered);
+    renderKPIs(sorted);
+    renderMainChart(sorted);
+    renderGroupChart(sorted);
+    renderTable(sorted);
+  }}
+
+  window.addEventListener('DOMContentLoaded', ()=>{
+    populateFilters(RAW_DATA);
+    document.getElementById('f-colab').addEventListener('change', refresh);
+    document.getElementById('f-status').addEventListener('change', refresh);
+    document.getElementById('btn-export').addEventListener('click', exportCSV);
+    refresh();
+  });
+"""
+
+INDEX_HTML = f"""<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Dashboard de Treinamentos</title>
+  <link rel="icon" href="favicon.ico"/>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+{CSS}
+  </style>
+</head>
+<body>
+  <header>
+    {logo_html}
+    <div>
+      <h1>Dashboard de Treinamentos</h1>
+      <div class="subtitle">Atualizado em {date.today().isoformat()}</div>
+      <nav>
+        <a href="index.html">Dashboard</a> · <a href="about.html">Como ler este dashboard</a>
+      </nav>
+    </div>
+  </header>
+
+  <div class="bar">
+    <select id="f-colab" title="Filtrar por colaborador"></select>
+    <select id="f-status" title="Filtrar por status"></select>
+    <button id="btn-export">Baixar CSV (filtro atual)</button>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi kpi-red">Vencidos<br><span id="kpi-venc">-</span></div>
+    <div class="kpi kpi-amber">A vencer (&le;30d)<br><span id="kpi-30">-</span></div>
+    <div class="kpi kpi-green">Dentro do prazo<br><span id="kpi-ok">-</span></div>
+  </div>
+
+  <div class="layout">
+    <div class="card"><div id="chart-main"></div></div>
+    <div class="card"><div id="chart-group"></div></div>
+  </div>
+
+  <div class="card">
+    <h3>Detalhamento</h3>
+    <table id="tbl">
+      <thead></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <footer>
+    Publicado via GitHub Pages · Build automático diário · © {date.today().year}
+  </footer>
+
+  <script>
+{JS}
+  </script>
+</body>
+</html>
+"""
+
